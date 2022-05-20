@@ -5,16 +5,17 @@ from config import Config
 
 
 class CNewSumDataset(torch.utils.data.Dataset):
+
     def __init__(self, data_path, split, retriever_tokenizer, generator_tokenizer) -> None:
         self.datas = list()
         self.retriever_tokenizer = retriever_tokenizer
         self.generator_tokenizer = generator_tokenizer
         file = data_path + split + '.simple.label.jsonl'
-        bmt.print_rank('Start loading dataset' + file)
+        bmt.print_rank(f'Start loading dataset {file}.')
         with open(file, 'r') as fp:
             for i, line in enumerate(fp):
                 if (i + 1) % 10000 == 0:
-                    bmt.print_rank('Loading dataset number ' + str(i + 1) + '.')
+                    bmt.print_rank(f'Loading dataset number {i + 1}.')
                 line_json = json.loads(line)
                 retriever_input_ids, retriever_attention_masks, cls_ids = self.tokenize_retriever(src_text=line_json['article'])
                 context_input_ids, labels = self.tokenize_generator(src_text=line_json['article'], summary=line_json['summary'])

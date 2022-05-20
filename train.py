@@ -1,4 +1,4 @@
-import torch, jieba, os, re
+import torch, os, re
 import bmtrain as bmt
 import numpy as np
 from transformers import BertTokenizer
@@ -14,6 +14,7 @@ from rouge import Rouge
 
 
 class FineTuneCPM:
+
     def __init__(self):
         bmt.init_distributed(loss_scale_factor=2, loss_scale_steps=1024)
         if Config.save_model_dir != None:
@@ -38,10 +39,10 @@ class FineTuneCPM:
             self.datasets[split] = CNewSumDataset(Config.data_path, split, self.retriever_tokenizer, self.generator_tokenizer)
     
     def load_model(self, name):
-        bmt.load(self.retriever_model, '/data2/private/luofuwen/saved_models/' + name + '_retriever_model.pt')
-        bmt.load(self.generator_model, '/data2/private/luofuwen/saved_models/' + name + '_generator_model.pt')
-        self.retriever_model.load_state_dict(torch.load('/data2/private/luofuwen/saved_models/' + name + '_retriever_model.pt'), strict=True)
-        self.generator_model.load_state_dict(torch.load('/data2/private/luofuwen/saved_models/' + name + '_generator_model.pt'), strict=True)
+        bmt.load(self.retriever_model, Config.save_model_dir + name + '_retriever_model.pt')
+        bmt.load(self.generator_model, Config.save_model_dir + name + '_generator_model.pt')
+        self.retriever_model.load_state_dict(torch.load(Config.save_model_dir + name + '_retriever_model.pt'), strict=True)
+        self.generator_model.load_state_dict(torch.load(Config.save_model_dir + name + '_generator_model.pt'), strict=True)
 
     def train(self):
         criterion_cls = torch.nn.CrossEntropyLoss(reduction='none')
@@ -59,7 +60,7 @@ class FineTuneCPM:
             self.retriever_optimizer.zero_grad()
             self.generator_optimizer.zero_grad()
             # train
-            bmt.print_rank('Train epoch ' + str(epoch_num) + '.')
+            bmt.print_rank(f'Training epoch {epoch_num}.')
             for iter_num, [retriever_input_ids, retriever_attention_masks, cls_ids, oracle, context_input_ids, labels] in enumerate(dataloader['train']):
                 retriever_input_ids, retriever_attention_masks, cls_ids, oracle, context_input_ids, labels = \
                     retriever_input_ids.cuda().squeeze(0), retriever_attention_masks.cuda().squeeze(0), cls_ids.cuda().squeeze(0), oracle.cuda().squeeze(0), context_input_ids.cuda().squeeze(0), labels.cuda().squeeze(0)
@@ -112,14 +113,14 @@ class FineTuneCPM:
                     bmt.save(self.retriever_model, Config.save_model_dir + 'training_' + str(epoch_num) + '_' + str(iter_num) + '_retriever_model.pt')
                     bmt.save(self.generator_model, Config.save_model_dir + 'training_' + str(epoch_num) + '_' + str(iter_num) + '_generator_model.pt')
                 if (iter_num + 1) % Config.train_log_steps == 0:
-                    bmt.print_rank('Traing iter ' + str(iter_num + 1) + '.')
+                    bmt.print_rank(f'Training iter {iter_num + 1}.')
 
             # validation
             self.retriever_model.eval()
             self.generator_model.eval()
             with torch.no_grad():
                 inputs, selections, outputs, refs = list(), list(), list(), list()
-                bmt.print_rank('Validate epoch ' + str(epoch_num) + '.')
+                bmt.print_rank(f'Validate epoch {epoch_num}.')
                 for iter_num, [retriever_input_ids, retriever_attention_masks, cls_ids, oracle, context_input_ids, labels] in enumerate(dataloader['dev']):
                     retriever_input_ids, retriever_attention_masks, cls_ids, oracle, context_input_ids, labels = \
                         retriever_input_ids.cuda().squeeze(0), retriever_attention_masks.cuda().squeeze(0), cls_ids.cuda().squeeze(0), oracle.cuda().squeeze(0), context_input_ids.cuda().squeeze(0), labels.cuda().squeeze(0)
@@ -139,7 +140,7 @@ class FineTuneCPM:
                     outputs.append(self.generator_tokenizer.decode(output_ids.cpu().tolist()) + '\n')
                     refs.append(self.generator_tokenizer.decode(labels.cpu().tolist()) + '\n')
                     if (iter_num + 1) % Config.validation_log_steps == 0:
-                        bmt.print_rank('Validating iter ' + str(iter_num + 1) + '.')
+                        bmt.print_rank(f'Validating iter {iter_num + 1}.')
 
                 with open(Config.output_dir + str(bmt.rank()) + '_' + str(epoch_num) + '_inputs.txt', 'w') as fp:
                     fp.writelines(inputs)
@@ -150,11 +151,15 @@ class FineTuneCPM:
                 with open(Config.output_dir + str(bmt.rank()) + '_' + str(epoch_num) + '_refs.txt', 'w') as fp:
                     fp.writelines(refs)
 
-                global_metrics = bmt.sum_loss(torch.Tensor([self.rouge_score(outputs, refs)]).cuda(), method='sum').item()
-                if global_metrics > best_metrics:
+                rouge_1, rouge_2, rouge_l = self.rouge_score(outputs, refs)
+                global_rouge_1 = bmt.sum_loss(torch.Tensor([rouge_1]).cuda()).item()
+                global_rouge_2 = bmt.sum_loss(torch.Tensor([rouge_2]).cuda()).item()
+                global_rouge_l = bmt.sum_loss(torch.Tensor([rouge_l]).cuda()).item()
+                bmt.print_rank(f'Rouge score: rouge-1 {global_rouge_1}, rouge-2 {global_rouge_2}, rouge-l {global_rouge_l}.')
+                if global_rouge_1 + global_rouge_2 + global_rouge_l > best_metrics:
                     # save best model
-                    bmt.print_rank('Update metrics:' + str(best_metrics) + ' -> ' + str(global_metrics) + '.')
-                    best_metrics = global_metrics
+                    bmt.print_rank(f'Update metrics: {best_metrics} -> {global_rouge_1 + global_rouge_2 + global_rouge_l}.')
+                    best_metrics = global_rouge_1 + global_rouge_2 + global_rouge_l
                     no_improvement_num = 0
                     bmt.save(self.retriever_model, Config.save_model_dir + 'best_' + str(epoch_num) + '_retriever_model.pt')
                     bmt.save(self.generator_model, Config.save_model_dir + 'best_' + str(epoch_num) + '_generator_model.pt')
@@ -170,22 +175,29 @@ class FineTuneCPM:
                         for param_group in self.retriever_optimizer.param_groups:
                             param_group['lr'] = self.generator_lr
                         no_improvement_num = 0
-                    bmt.print_rank('No improvement: no improvement ' + str(no_improvement_num) + ' / ' + str(Config.no_improvement_decay) + ', decay num ' + str(decay_num) + ' / ' + str(Config.max_decay_num) + '.')
+                    bmt.print_rank(f'No improvement: no improvement {no_improvement_num} / {Config.no_improvement_decay}, decay num {decay_num} / {Config.max_decay_num}.')
 
     def rouge_score(self, preds, refs):
-        res = list()
+        rouge_1, rouge_2, rouge_l = list(), list(), list()
         for pred, ref in zip(preds, refs):
             pred = re.sub('<\w+>', '', pred)
             ref = re.sub('<\w+>', '', ref)
-            pred = " ".join([w for w in jieba.cut("".join(pred.strip()))])
-            ref = " ".join([w for w in jieba.cut("".join(ref.strip()))])
-            if len(ref) == 0 or len(pred) == 0:
-                res.extend([0, 0, 0])
+            pred = ' '.join(pred)
+            ref = ' '.join(ref)
+
+            if len(ref) == 0 and len(pred) == 0:
+                continue
+            elif len(pred) == 0:
+                rouge_1.append(0)
+                rouge_2.append(0)
+                rouge_l.append(0)
             else:
                 score = Rouge().get_scores(refs=ref, hyps=pred)[0]
-                res.extend([score['rouge-1']['f'], score['rouge-2']['f'], score['rouge-l']['f']])
+                rouge_1.append(score['rouge-1']['f'])
+                rouge_2.append(score['rouge-2']['f'])
+                rouge_l.append(score['rouge-l']['f'])
 
-        return np.mean(res) * 3
+        return np.array(rouge_1).mean(), np.array(rouge_2).mean(), np.array(rouge_l).mean()
 
 
 if __name__ == "__main__":
