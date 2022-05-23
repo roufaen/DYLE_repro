@@ -41,8 +41,6 @@ class FineTuneCPM:
     def load_model(self, name):
         bmt.load(self.retriever_model, Config.save_model_dir + name + '_retriever_model.pt')
         bmt.load(self.generator_model, Config.save_model_dir + name + '_generator_model.pt')
-        self.retriever_model.load_state_dict(torch.load(Config.save_model_dir + name + '_retriever_model.pt'), strict=True)
-        self.generator_model.load_state_dict(torch.load(Config.save_model_dir + name + '_generator_model.pt'), strict=True)
 
     def train(self):
         criterion_cls = torch.nn.CrossEntropyLoss(reduction='none')
